@@ -10,6 +10,8 @@ env:
 jobs:
   build-cross:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       RUST_BACKTRACE: full
     strategy:
@@ -45,6 +47,8 @@ jobs:
           prerelease: ${{ contains(github.ref, '-') }}
   build-unix:
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     env:
       RUST_BACKTRACE: full
     strategy:
