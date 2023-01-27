@@ -1,7 +1,7 @@
 version: '2.4'
 services:
   shadow-tls:
-    image: ghcr.io/ihciah/shadow-tls:latest
+    image: ghcr.io/0xf00f00/shadow-tls:latest
     container_name: shadow-tls
     restart: always
     network_mode: "host"
