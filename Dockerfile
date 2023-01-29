@@ -26,7 +26,7 @@ COPY --from=sources /usr/src/shadow-tls/vendor ./vendor
 
 RUN RUSTFLAGS="" cargo build --bin shadow-tls --release --offline
 
-FROM alpine:latest
+FROM debian:stable-slim
 
 ENV MODE=""
 ENV LISTEN=""
@@ -37,6 +37,6 @@ ENV PASSWORD=""
 ENV DISABLE_NODELAY=""
 
 COPY ./entrypoint.sh /
-RUN chmod +x /entrypoint.sh && apk add --no-cache ca-certificates
+RUN chmod +x /entrypoint.sh && apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /usr/src/shadow-tls/target/release/shadow-tls /usr/local/bin/shadow-tls
 ENTRYPOINT ["/entrypoint.sh"]
