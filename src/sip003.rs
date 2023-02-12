@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use tracing::error;
 
 use super::Args;
@@ -39,23 +39,27 @@ pub(crate) fn get_sip003_arg() -> Option<Args> {
     let opts: HashMap<_, _> = opts.into_iter().collect();
 
     let threads = opts.get("threads").map(|s| s.parse::<u8>().unwrap());
+    let v3 = opts.get("v3").is_some();
     let passwd = opts
         .get("passwd")
         .expect("need passwd param(like passwd=123456)");
 
     let args_opts = crate::Opts {
         threads,
+        v3,
         ..Default::default()
     };
     let args = if opts.get("server").is_some() {
         let tls_addr = opts
             .get("tls")
-            .expect("need tls param(like tls=xxx.com:443)");
+            .expect("tls param must be specified(like tls=xxx.com:443)");
+        let tls_addrs = crate::server::parse_server_addrs(tls_addr)
+            .expect("tls param parse failed(like tls=xxx.com:443 or tls=yyy.com:1.2.3.4:443;zzz.com:443;xxx.com)");
         Args {
             cmd: crate::Commands::Server {
                 listen: format!("{ss_remote_host}:{ss_remote_port}"),
                 server_addr: format!("{ss_local_host}:{ss_local_port}"),
-                tls_addr: tls_addr.to_owned(),
+                tls_addr: tls_addrs,
                 password: passwd.to_owned(),
             },
             opts: args_opts,
@@ -64,11 +68,12 @@ pub(crate) fn get_sip003_arg() -> Option<Args> {
         let host = opts
             .get("host")
             .expect("need host param(like host=www.baidu.com)");
+        let hosts = crate::client::parse_client_names(host).expect("tls names parse failed");
         Args {
             cmd: crate::Commands::Client {
                 listen: format!("{ss_local_host}:{ss_local_port}"),
                 server_addr: format!("{ss_remote_host}:{ss_remote_port}"),
-                tls_name: host.to_owned(),
+                tls_names: hosts,
                 password: passwd.to_owned(),
                 alpn: Default::default(),
             },
@@ -86,7 +91,7 @@ fn parse_sip003_options(s: &str) -> Result<Vec<(String, String)>, anyhow::Error>
         // read key
         let (offset, key) = index_unescaped(&s[i..], &[b'=', b';']).context("read key")?;
         if key.is_empty() {
-            return Err(anyhow::format_err!("empty key in {}", &s[i..]));
+            bail!("empty key in {}", &s[i..]);
         }
         i += offset;
         // end of string or no equals sign
@@ -120,10 +125,7 @@ fn index_unescaped(s: &str, term: &[u8]) -> Result<(usize, String), anyhow::Erro
         if b == b'\\' {
             i += 1;
             if i >= s.len() {
-                return Err(anyhow::format_err!(
-                    "nothing following final escape in {}",
-                    s
-                ));
+                bail!("nothing following final escape in {s}",);
             }
             b = s.as_bytes()[i];
         }

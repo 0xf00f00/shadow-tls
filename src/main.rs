@@ -3,20 +3,19 @@
 #![feature(type_alias_impl_trait)]
 
 mod client;
+mod helper_v2;
 mod server;
 mod sip003;
-mod stream;
 mod util;
 
-use std::{fmt::Display, rc::Rc, sync::Arc};
+use std::fmt::Display;
 
 use clap::{Parser, Subcommand};
-use monoio::net::TcpListener;
-use tracing::{error, info};
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};
 
 use crate::{
-    client::ShadowTlsClient, client::TlsExtConfig, server::ShadowTlsServer, util::mod_tcp_conn,
+    client::{parse_client_names, ShadowTlsClient, TlsExtConfig, TlsNames},
+    server::{parse_server_addrs, ShadowTlsServer, TlsAddrs},
 };
 
 #[derive(Parser, Debug)]
@@ -34,25 +33,13 @@ struct Args {
 }
 
 #[derive(Parser, Debug, Default, Clone)]
-pub struct Opts {
+struct Opts {
     #[clap(short, long, help = "Set parallelism manually")]
     threads: Option<u8>,
     #[clap(short, long, help = "Disable TCP_NODELAY")]
     disable_nodelay: bool,
-}
-
-impl Display for Opts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.threads {
-            Some(t) => {
-                write!(f, "fixed {t} threads")
-            }
-            None => {
-                write!(f, "auto adjusted threads")
-            }
-        }?;
-        write!(f, "; nodelay: {}", !self.disable_nodelay)
-    }
+    #[clap(long, help = "Use v3 protocol")]
+    v3: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -62,84 +49,190 @@ enum Commands {
         #[clap(
             long = "listen",
             default_value = "[::1]:8080",
-            help = "Shadow-tls client listen address"
+            help = "Shadow-tls client listen address(like \"[::1]:8080\")"
         )]
         listen: String,
         #[clap(
             long = "server",
-            help = "Your shadow-tls server address(like 1.2.3.4:443)"
+            help = "Your shadow-tls server address(like \"1.2.3.4:443\")"
         )]
         server_addr: String,
-        #[clap(long = "sni", help = "TLS handshake SNI(like cloud.tencent.com)")]
-        tls_name: String,
+        #[clap(
+            long = "sni",
+            help = "TLS handshake SNIs(like \"cloud.tencent.com\", \"captive.apple.com;cloud.tencent.com\")",
+            value_parser = parse_client_names
+        )]
+        tls_names: TlsNames,
         #[clap(long = "password", help = "Password")]
         password: String,
         #[clap(
             long = "alpn",
-            help = "Application-Layer Protocol Negotiation(like \"http/1.1\")"
+            help = "Application-Layer Protocol Negotiation list(like \"http/1.1\", \"http/1.1;h2\")",
+            value_delimiter = ';'
         )]
-        alpn: Option<String>,
+        alpn: Option<Vec<String>>,
     },
     #[clap(about = "Run server side")]
     Server {
         #[clap(
             long = "listen",
-            default_value = "[::1]:443",
-            help = "Shadow-tls server listen address"
+            default_value = "[::]:443",
+            help = "Shadow-tls server listen address(like \"[::]:443\")"
         )]
         listen: String,
         #[clap(
             long = "server",
-            help = "Your data server address(like 127.0.0.1:8080)"
+            help = "Your data server address(like \"127.0.0.1:8080\")"
         )]
         server_addr: String,
         #[clap(
             long = "tls",
-            help = "TLS handshake server address(with port, like cloud.tencent.com:443)"
+            help = "TLS handshake server address(like \"cloud.tencent.com:443\", \"cloudflare.com:1.1.1.1:443;captive.apple.com;cloud.tencent.com\")",
+            value_parser = parse_server_addrs
         )]
-        tls_addr: String,
+        tls_addr: TlsAddrs,
         #[clap(long = "password", help = "Password")]
         password: String,
     },
 }
 
-impl Args {
-    async fn start(&self) {
-        match &self.cmd {
+enum RunningArgs {
+    Client {
+        listen_addr: String,
+        target_addr: String,
+        tls_names: TlsNames,
+        tls_ext: TlsExtConfig,
+        password: String,
+        nodelay: bool,
+        v3: bool,
+    },
+    Server {
+        listen_addr: String,
+        target_addr: String,
+        tls_addr: TlsAddrs,
+        password: String,
+        nodelay: bool,
+        v3: bool,
+    },
+}
+
+impl From<Args> for RunningArgs {
+    fn from(args: Args) -> Self {
+        match args.cmd {
             Commands::Client {
                 listen,
                 server_addr,
-                tls_name,
+                tls_names,
                 password,
                 alpn,
-            } => {
-                run_client(
-                    listen.clone(),
-                    server_addr.clone(),
-                    tls_name.clone(),
-                    password.clone(),
-                    self.opts.clone(),
-                    TlsExtConfig::new(alpn.clone().map(|alpn| vec![alpn.into_bytes()])),
-                )
-                .await
-                .expect("client exited");
-            }
+            } => Self::Client {
+                listen_addr: listen,
+                target_addr: server_addr,
+                tls_names,
+                tls_ext: TlsExtConfig::from(alpn),
+                password,
+                nodelay: !args.opts.disable_nodelay,
+                v3: args.opts.v3,
+            },
             Commands::Server {
                 listen,
                 server_addr,
                 tls_addr,
                 password,
+            } => Self::Server {
+                listen_addr: listen,
+                target_addr: server_addr,
+                tls_addr,
+                password,
+                nodelay: !args.opts.disable_nodelay,
+                v3: args.opts.v3,
+            },
+        }
+    }
+}
+
+impl RunningArgs {
+    fn build(self) -> anyhow::Result<Runnable<String, String>> {
+        match self {
+            RunningArgs::Client {
+                listen_addr,
+                target_addr,
+                tls_names,
+                tls_ext,
+                password,
+                nodelay,
+                v3,
+            } => Ok(Runnable::Client(ShadowTlsClient::new(
+                listen_addr,
+                target_addr,
+                tls_names,
+                tls_ext,
+                password,
+                nodelay,
+                v3,
+            )?)),
+            RunningArgs::Server {
+                listen_addr,
+                target_addr,
+                tls_addr,
+                password,
+                nodelay,
+                v3,
+            } => Ok(Runnable::Server(ShadowTlsServer::new(
+                listen_addr,
+                target_addr,
+                tls_addr,
+                password,
+                nodelay,
+                v3,
+            ))),
+        }
+    }
+}
+
+impl Display for RunningArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client {
+                listen_addr,
+                target_addr,
+                tls_names,
+                tls_ext,
+                nodelay,
+                v3,
+                ..
             } => {
-                run_server(
-                    listen.clone(),
-                    server_addr.clone(),
-                    tls_addr.clone(),
-                    password.clone(),
-                    self.opts.clone(),
-                )
-                .await
-                .expect("server exited");
+                write!(f, "Client with:\nListen address: {listen_addr}\nTarget address: {target_addr}\nTLS server names: {tls_names}\nTLS Extension: {tls_ext}\nTCP_NODELAY: {nodelay}\nV3 Protocol: {v3}")
             }
+            Self::Server {
+                listen_addr,
+                target_addr,
+                tls_addr,
+                nodelay,
+                v3,
+                ..
+            } => {
+                write!(f, "Server with:\nListen address: {listen_addr}\nTarget address: {target_addr}\nTLS server address: {tls_addr}\nTCP_NODELAY: {nodelay}\nV3 Protocol: {v3}")
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Runnable<A, B> {
+    Client(ShadowTlsClient<A, B>),
+    Server(ShadowTlsServer<A, B>),
+}
+
+impl<A, B> Runnable<A, B>
+where
+    A: std::net::ToSocketAddrs + 'static,
+    B: std::net::ToSocketAddrs + 'static,
+{
+    async fn serve(self) -> anyhow::Result<()> {
+        match self {
+            Runnable::Client(c) => c.serve().await,
+            Runnable::Server(s) => s.serve().await,
         }
     }
 }
@@ -150,24 +243,25 @@ fn main() {
         .with(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
+                .from_env_lossy()
+                .add_directive("rustls=off".parse().unwrap()),
         )
         .init();
-    let args = match sip003::get_sip003_arg() {
-        Some(a) => Arc::new(a),
-        None => Arc::new(Args::parse()),
-    };
-    let mut threads = Vec::new();
+    let args = sip003::get_sip003_arg().unwrap_or_else(Args::parse);
     let parallelism = get_parallelism(&args);
-    info!("Started with parallelism {parallelism}");
+    let running_args = RunningArgs::from(args);
+    tracing::info!("Start {parallelism}-thread {running_args}");
+
+    let runnable = running_args.build().expect("unable to build runnable");
+    let mut threads = Vec::new();
     for _ in 0..parallelism {
-        let args_clone = args.clone();
+        let runnable_clone = runnable.clone();
         let t = std::thread::spawn(move || {
             let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                 .enable_timer()
                 .build()
-                .expect("unable to build monoio runtime");
-            rt.block_on(args_clone.start());
+                .expect("unable to build monoio runtime(please refer to: https://github.com/ihciah/shadow-tls/wiki/How-to-Run#common-issues)");
+            let _ = rt.block_on(runnable_clone.serve());
         });
         threads.push(t);
     }
@@ -186,63 +280,4 @@ fn get_parallelism(args: &Args) -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-}
-
-async fn run_client(
-    listen: String,
-    server_addr: String,
-    tls_name: String,
-    password: String,
-    opts: Opts,
-    tls_ext: TlsExtConfig,
-) -> anyhow::Result<()> {
-    info!("Client is running!\nListen address: {listen}\nRemote address: {server_addr}\nTLS server name: {tls_name}\nOpts: {opts}");
-    let nodelay = !opts.disable_nodelay;
-    let shadow_client = Rc::new(ShadowTlsClient::new(
-        &tls_name,
-        server_addr,
-        password,
-        opts,
-        tls_ext,
-    )?);
-    let listener = TcpListener::bind(&listen)?;
-    loop {
-        match listener.accept().await {
-            Ok((mut conn, addr)) => {
-                info!("Accepted a connection from {addr}");
-                let client = shadow_client.clone();
-                mod_tcp_conn(&mut conn, true, nodelay);
-                monoio::spawn(async move { client.relay(conn, addr).await });
-            }
-            Err(e) => {
-                error!("Accept failed: {e}");
-            }
-        }
-    }
-}
-
-async fn run_server(
-    listen: String,
-    server_addr: String,
-    tls_addr: String,
-    password: String,
-    opts: Opts,
-) -> anyhow::Result<()> {
-    info!("Server is running!\nListen address: {listen}\nRemote address: {server_addr}\nTLS server address: {tls_addr}\nOpts: {opts}");
-    let nodelay = !opts.disable_nodelay;
-    let shadow_server = Rc::new(ShadowTlsServer::new(tls_addr, server_addr, password, opts));
-    let listener = TcpListener::bind(&listen)?;
-    loop {
-        match listener.accept().await {
-            Ok((mut conn, addr)) => {
-                info!("Accepted a connection from {addr}");
-                mod_tcp_conn(&mut conn, true, nodelay);
-                let server = shadow_server.clone();
-                monoio::spawn(async move { server.relay(conn).await });
-            }
-            Err(e) => {
-                error!("Accept failed: {e}");
-            }
-        }
-    }
 }

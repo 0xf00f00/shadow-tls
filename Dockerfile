@@ -34,7 +34,9 @@ ENV SERVER=""
 ENV TLS=""
 ENV THREADS=""
 ENV PASSWORD=""
+ENV ALPN=""
 ENV DISABLE_NODELAY=""
+ENV V3=""
 
 COPY ./entrypoint.sh /
 RUN chmod +x /entrypoint.sh && apt-get update && apt-get install -y --no-install-recommends ca-certificates

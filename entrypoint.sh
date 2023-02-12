@@ -10,6 +10,11 @@ then
     parameter="$parameter --disable-nodelay"
 fi
 
+if [ ! -z "$V3" ]
+then
+    parameter="$parameter --v3"
+fi
+
 if [ "$MODE" = "server" ]
 then
     parameter="$parameter $MODE"
@@ -27,6 +32,11 @@ then
     if [ ! -z "$TLS" ]
     then
         parameter="$parameter --sni $TLS"
+    fi
+
+    if [ ! -z "$ALPN" ]
+    then
+        parameter="$parameter --alpn $ALPN"
     fi
 fi
 
