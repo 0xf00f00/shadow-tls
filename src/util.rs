@@ -1,11 +1,11 @@
-use std::{ptr::copy_nonoverlapping, time::Duration};
+use std::{io::ErrorKind, net::ToSocketAddrs, ptr::copy_nonoverlapping, time::Duration};
 
 use byteorder::{BigEndian, WriteBytesExt};
 use local_sync::oneshot::{Receiver, Sender};
 use monoio::{
     buf::IoBufMut,
     io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
 };
 
 use hmac::Mac;
@@ -39,6 +39,35 @@ pub mod prelude {
     pub const HMAC_SIZE: usize = 4;
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum V3Mode {
+    Disabled,
+    Lossy,
+    Strict,
+}
+
+impl std::fmt::Display for V3Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            V3Mode::Disabled => write!(f, "disabled"),
+            V3Mode::Lossy => write!(f, "enabled(lossy)"),
+            V3Mode::Strict => write!(f, "enabled(strict)"),
+        }
+    }
+}
+
+impl V3Mode {
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        !matches!(self, V3Mode::Disabled)
+    }
+
+    #[inline]
+    pub fn strict(&self) -> bool {
+        matches!(self, V3Mode::Strict)
+    }
+}
+
 pub async fn copy_until_eof<R, W>(mut read_half: R, mut write_half: W) -> std::io::Result<()>
 where
     R: monoio::io::AsyncReadRent,
@@ -67,6 +96,7 @@ pub fn mod_tcp_conn(conn: &mut TcpStream, keepalive: bool, nodelay: bool) {
     let _ = conn.set_nodelay(nodelay);
 }
 
+#[derive(Clone)]
 pub struct Hmac(hmac::Hmac<sha1::Sha1>);
 
 impl Hmac {
@@ -144,6 +174,19 @@ pub async fn verified_relay(
             let _ = tls_write.shutdown().await;
         }
     );
+}
+
+/// Bind with pretty error.
+pub fn bind_with_pretty_error<A: ToSocketAddrs>(addr: A) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(addr).map_err(|e| match e.kind() {
+        ErrorKind::AddrInUse => {
+            anyhow::anyhow!("bind failed, check if the port is used: {e}")
+        }
+        ErrorKind::PermissionDenied => {
+            anyhow::anyhow!("bind failed, check if permission configured correct: {e}")
+        }
+        _ => anyhow::anyhow!("bind failed: {e}"),
+    })
 }
 
 /// Remove application data header, verify hmac, remove the
