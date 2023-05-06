@@ -24,7 +24,8 @@ COPY ./ ./
 COPY --from=sources /usr/src/shadow-tls/.cargo ./.cargo
 COPY --from=sources /usr/src/shadow-tls/vendor ./vendor
 
-RUN RUSTFLAGS="" cargo build --bin shadow-tls --release --offline
+COPY . .
+RUN CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse RUSTFLAGS="" cargo build --bin shadow-tls --release
 
 FROM debian:stable-slim
 
